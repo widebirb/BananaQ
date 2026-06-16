@@ -1,0 +1,118 @@
+"""
+GitHub REST API client.
+
+Provides async functions for fetching PR diffs and posting
+line-level review comments. Uses httpx with a PAT for auth.
+"""
+from __future__ import annotations
+
+import logging
+
+import httpx
+
+from config.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+GITHUB_API = "https://api.github.com"
+
+
+def _headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+async def get_pr_diff(
+    settings: Settings,
+    owner: str,
+    repo: str,
+    pr_number: int,
+) -> str:
+    """Fetch the unified diff for a pull request.
+
+    Returns the raw diff string, or an empty string if unavailable.
+    """
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}"
+    headers = {**_headers(settings.github_token), "Accept": "application/vnd.github.v3.diff"}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        return response.text
+
+
+async def post_review_comments(
+    settings: Settings,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    commit_sha: str,
+    comments: list[dict],
+) -> None:
+    """Post a batch of line-level review comments to a pull request.
+
+    Each comment in `comments` must have:
+      - path: str       (file path relative to repo root)
+      - line: int       (line number in the diff, 1-indexed)
+      - body: str       (the review comment text)
+
+    Uses GitHub's "Create a review" endpoint so all comments are
+    submitted atomically as a single COMMENT review (no approve/reject).
+    """
+    if not comments:
+        logger.info("No comments to post — skipping GitHub API call.")
+        return
+
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+
+    # Build the review payload — submit as COMMENT (no approval verdict)
+    payload = {
+        "commit_id": commit_sha,
+        "event": "COMMENT",
+        "comments": [
+            {
+                "path": c["path"],
+                "line": c["line"],
+                "body": c["body"],
+                "side": "RIGHT",  # comment on the new (right-hand) side of the diff
+            }
+            for c in comments
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(url, headers=_headers(settings.github_token), json=payload)
+        if response.status_code not in (200, 201):
+            logger.error(
+                "Failed to post review: %s %s", response.status_code, response.text
+            )
+            response.raise_for_status()
+        else:
+            logger.info(
+                "Posted %d review comment(s) to %s/%s#%d.",
+                len(comments),
+                owner,
+                repo,
+                pr_number,
+            )
+
+
+async def post_pr_comment(
+    settings: Settings,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    body: str,
+) -> None:
+    """Post a plain issue comment on a PR (used for skip notices, errors, etc.)."""
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            url, headers=_headers(settings.github_token), json={"body": body}
+        )
+        response.raise_for_status()
+        logger.info("Posted PR comment to %s/%s#%d.", owner, repo, pr_number)

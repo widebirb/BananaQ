@@ -1,0 +1,9 @@
+{
+  "python.defaultInterpreterPath": ".venv\\Scripts\\python.exe",
+  "python.pythonPath": ".venv\\Scripts\\python.exe",
+  "python.analysis.extraPaths": [
+    "./"
+  ],
+  "python.analysis.diagnosticMode": "basic",
+  "pyrefly.enable": false
+}

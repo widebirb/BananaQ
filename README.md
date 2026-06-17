@@ -1,10 +1,10 @@
 # BananaQ 🍌
 
-AI-powered pull-request reviewer and orchestrator.
+Pull-request reviewer and orchestrator.
 
 ## Architecture
 
-BananaQ runs in a **hybrid setup**:
+BananaQ runs in a **hybrid setup** to minimize setup overhead:
 
 | Component | Where it runs |
 |-----------|--------------|
@@ -12,7 +12,25 @@ BananaQ runs in a **hybrid setup**:
 | Ngrok (webhook tunnel) | Local machine |
 | Ollama (LLM inference) | Vast.ai GPU instance (remote) |
 
-Ollama on the vast.ai instance is accessed securely via **SSH port forwarding** — no API keys or Cloudflare tunnels required.
+Ollama on the vast.ai instance is accessed securely via **SSH port forwarding**.
+
+---
+
+## How It Works
+
+When a pull request is opened or updated, BananaQ processes it through a two-agent pipeline:
+
+1. **Orchestrator** (`orchestrator/dispatcher.py`) triages the PR:
+   - Deterministic pre-filters skip non-code changes instantly (markdown, JSON, images, lock files)
+   - For code changes, the LLM decides whether the PR warrants a full review or can be skipped
+   - Uses a personality-driven playbook (`config/playbook.md`) blunt, direct, contractor energy
+
+2. **Reviewer Agent** (`agents/reviewer.py`) if dispatched:
+   - Receives the unified diff, calls the LLM, returns structured line-level comments
+   - Comments are validated against the actual diff to filter hallucinated line numbers
+   - Posted as a GitHub PR review with a "BananaQ automated review" header
+
+All comments clearly identify themselves as coming from BananaQ.
 
 ---
 
@@ -39,7 +57,7 @@ Create a `.env` file in the project root:
 ```env
 # GitHub
 GITHUB_TOKEN=ghp_YOUR_PAT_TOKEN         # PAT with repo + contents + metadata scopes
-GITHUB_WEBHOOK_SECRET=YOUR_SECRET        # Random string — must match your GitHub webhook setting
+GITHUB_WEBHOOK_SECRET=YOUR_SECRET        # Random string, must match your GitHub webhook setting
 GITHUB_REPO=your-username/your-repo
 
 # Ollama (keep this as localhost — traffic is forwarded via SSH tunnel)
@@ -65,10 +83,6 @@ ssh -p <SSH_PORT> root@<INSTANCE_IP> -L 11434:localhost:11434
 
 Replace `<SSH_PORT>` and `<INSTANCE_IP>` with the values from your instance's connection info on the [Vast.ai Console](https://cloud.vast.ai/).
 
-> **Keep this terminal open.** The SSH tunnel must stay alive for Ollama to be reachable at `localhost:11434`.
-
-When prompted about the host fingerprint on first connection, type `yes`.
-
 #### SSH key setup (first time only)
 
 Vast.ai uses key-based SSH authentication. If you don't have an SSH key yet:
@@ -85,7 +99,7 @@ Press Enter through all prompts. Then copy the contents of `~/.ssh/id_ed25519.pu
 curl http://localhost:11434/api/version
 ```
 
-You should get a JSON response. If not, Ollama may not be running on the instance — SSH into it and run `ollama serve`.
+You should get a JSON response. If not, Ollama may not be running on the instance, SSH into it and run `ollama serve`.
 
 ### Step 3: Start the BananaQ server
 
@@ -129,9 +143,9 @@ python -m pytest tests/ -v
    | `qwen3.5:35b` | ~24 GB | RTX 3090, RTX 4090, A10G |
 
 4. Allocate enough disk space for the model (at least 10 GB for 9b, 30 GB for 35b).
-5. Launch the instance. Ollama starts automatically — no manual `ollama serve` needed.
+5. Launch the instance. Ollama starts automatically.
 
-### Pulling a model (first time)
+### Pulling a model
 
 SSH into the instance and run:
 

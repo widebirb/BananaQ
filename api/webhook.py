@@ -1,10 +1,12 @@
 """
-Webhook endpoint — Phase 2.
+Webhook endpoint — Phase 2 + 3.
 
 Receives GitHub pull_request webhook events, verifies the HMAC-SHA256
-signature, fetches the PR diff, runs the orchestrator dispatcher to
-decide review vs. skip, and either posts line-level review comments
-or a personality-driven skip comment.
+signature, and routes to the appropriate pipeline:
+
+  - opened/synchronize/reopened → orchestrator triage → review or skip
+  - closed + merged              → changelog agent → README.md updated
+  - closed + not merged          → ignored (no action)
 """
 # ruff: noqa: E501
 from __future__ import annotations
@@ -17,9 +19,16 @@ import re
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from agents.changelog_updater import PRMeta, update_changelog
 from agents.reviewer import review_diff
 from config.settings import get_settings
-from github_client.client import get_pr_diff, post_pr_comment, post_review_comments
+from github_client.client import (
+    get_pr_diff,
+    get_readme,
+    post_pr_comment,
+    post_review_comments,
+    update_readme,
+)
 from orchestrator.dispatcher import dispatch
 
 logger = logging.getLogger(__name__)
@@ -53,8 +62,13 @@ def _verify_signature(secret: str, body: bytes, signature_header: str | None) ->
 # ---------------------------------------------------------------------------
 
 def _is_reviewable_event(event_type: str, action: str) -> bool:
-    """Return True only for PR events we care about."""
+    """Return True for PR open/sync/reopen events."""
     return event_type == "pull_request" and action in ("opened", "synchronize", "reopened")
+
+
+def _is_merged_event(event_type: str, action: str, merged: bool) -> bool:
+    """Return True for a merged PR close event."""
+    return event_type == "pull_request" and action == "closed" and merged
 
 
 def _is_diff_reviewable(diff: str) -> bool:
@@ -131,7 +145,72 @@ def _build_event_summary(action: str, pr: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Background task: the review pipeline with orchestrator
+# Changelog helpers
+# ---------------------------------------------------------------------------
+
+def _prepend_changelog_entry(readme: str, entry: str) -> str:
+    """Prepend a new entry under the '## Changelog' section (newest first).
+
+    If the section doesn't exist, appends it at the end of the file.
+    """
+    section_header = "## Changelog"
+
+    if section_header in readme:
+        lines = readme.splitlines(keepends=True)
+        result = []
+        inserted = False
+        for line in lines:
+            result.append(line)
+            if not inserted and line.strip() == section_header:
+                result.append(entry + "\n")
+                inserted = True
+        return "".join(result)
+    else:
+        separator = "\n" if readme.endswith("\n") else "\n\n"
+        return f"{readme}{separator}{section_header}\n{entry}\n"
+
+
+# ---------------------------------------------------------------------------
+# Background task: changelog pipeline (closed + merged)
+# ---------------------------------------------------------------------------
+
+async def _run_changelog_pipeline(
+    owner: str,
+    repo: str,
+    pr_meta: PRMeta,
+) -> None:
+    """Generate changelog entry → fetch README → prepend → commit. Background task."""
+    settings = get_settings()
+
+    try:
+        logger.info(
+            "Running changelog pipeline for %s/%s#%d …", owner, repo, pr_meta.number
+        )
+
+        # 1. Generate changelog entry via LLM
+        entry = await update_changelog(pr_meta, settings)
+
+        # 2. Fetch current README.md from main
+        readme_content, sha = await get_readme(settings, owner, repo, ref="main")
+
+        # 3. Prepend the entry under the Changelog section
+        updated_readme = _prepend_changelog_entry(readme_content, entry)
+
+        # 4. Commit the updated README.md back to main
+        commit_msg = f"chore: add changelog entry for PR #{pr_meta.number} [skip ci]"
+        await update_readme(settings, owner, repo, updated_readme, sha, commit_msg)
+
+        logger.info("Changelog updated for %s/%s#%d.", owner, repo, pr_meta.number)
+
+    except Exception:
+        logger.exception(
+            "Unexpected error during changelog pipeline for %s/%s#%d.",
+            owner, repo, pr_meta.number,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Background task: review pipeline (opened/synchronize/reopened)
 # ---------------------------------------------------------------------------
 
 async def _run_review_pipeline(
@@ -244,34 +323,45 @@ async def github_webhook(
 
     action: str = payload.get("action", "")
     event_type: str = x_github_event or ""
-
-    # --- 3. Pre-filter: only handle relevant PR events ---
-    if not _is_reviewable_event(event_type, action):
-        logger.info("Ignoring event: type=%r action=%r", event_type, action)
-        return JSONResponse({"status": "ignored", "reason": "not a reviewable PR event"})
-
-    # --- 4. Extract PR metadata ---
     pr = payload.get("pull_request", {})
     pr_number: int = pr.get("number")
-    commit_sha: str = pr.get("head", {}).get("sha", "")
+    merged: bool = bool(pr.get("merged", False))
     repo_info = payload.get("repository", {})
     owner: str = repo_info.get("owner", {}).get("login", settings.repo_owner)
     repo: str = repo_info.get("name", settings.repo_name)
 
-    if not pr_number or not commit_sha:
-        raise HTTPException(status_code=422, detail="Missing pr_number or commit_sha in payload.")
+    # --- 3. Route: merged PR → changelog pipeline ---
+    if _is_merged_event(event_type, action, merged):
+        if not pr_number:
+            raise HTTPException(status_code=422, detail="Missing pr_number in payload.")
 
-    # --- 5. Build event summary for the orchestrator ---
-    event_summary = _build_event_summary(action, pr)
+        pr_meta = PRMeta(
+            number=pr_number,
+            title=pr.get("title", ""),
+            body=pr.get("body") or "",
+            merged_at=pr.get("merged_at"),
+        )
 
-    logger.info(
-        "Accepted %s event for %s/%s#%d (sha=%s).",
-        action, owner, repo, pr_number, commit_sha[:7],
-    )
+        logger.info("Accepted merged PR event for %s/%s#%d.", owner, repo, pr_number)
+        background_tasks.add_task(_run_changelog_pipeline, owner, repo, pr_meta)
+        return JSONResponse({"status": "accepted", "pr": pr_number, "pipeline": "changelog"})
 
-    # --- 6. Kick off review in the background (don't block GitHub's 10s timeout) ---
-    background_tasks.add_task(
-        _run_review_pipeline, owner, repo, pr_number, commit_sha, event_summary
-    )
+    # --- 4. Route: opened/sync/reopened → review pipeline ---
+    if _is_reviewable_event(event_type, action):
+        commit_sha: str = pr.get("head", {}).get("sha", "")
+        if not pr_number or not commit_sha:
+            raise HTTPException(status_code=422, detail="Missing pr_number or commit_sha in payload.")
 
-    return JSONResponse({"status": "accepted", "pr": pr_number})
+        event_summary = _build_event_summary(action, pr)
+        logger.info(
+            "Accepted %s event for %s/%s#%d (sha=%s).",
+            action, owner, repo, pr_number, commit_sha[:7],
+        )
+        background_tasks.add_task(
+            _run_review_pipeline, owner, repo, pr_number, commit_sha, event_summary
+        )
+        return JSONResponse({"status": "accepted", "pr": pr_number, "pipeline": "review"})
+
+    # --- 5. Everything else → ignore ---
+    logger.info("Ignoring event: type=%r action=%r merged=%r", event_type, action, merged)
+    return JSONResponse({"status": "ignored", "reason": "not a handled PR event"})

@@ -1,11 +1,12 @@
 """
-Orchestrator Dispatcher, Phase 2.
+Orchestrator Dispatcher.
 
 Sits between the webhook pre-filter and the reviewer agent.
 Loads the playbook persona as a system prompt, sends event context
 to the LLM, and returns a structured dispatch decision:
-  - "review" → hand off to pr_reviewer agent
-  - "skip"   → post a personality-driven skip comment
+  - "review"    -> hand off to pr_reviewer agent
+  - "skip"      -> post a personality-driven skip comment
+  - "changelog" -> deterministic fast path for merged PRs (no LLM call)
 
 The LLM is called with JSON mode and validated against a Pydantic model.
 Up to 2 retry attempts on malformed output, then falls back to "review"
@@ -42,12 +43,12 @@ _SKIP_EXTENSIONS = frozenset({
 class DispatchDecision(BaseModel):
     """Structured output from the orchestrator LLM."""
 
-    action: Literal["review", "skip"] = Field(
-        description="Whether to dispatch the reviewer or skip this PR."
+    action: Literal["review", "skip", "changelog"] = Field(
+        description="Whether to dispatch the reviewer, skip, or run the changelog agent."
     )
     agent: str | None = Field(
         default=None,
-        description="Agent to dispatch. 'pr_reviewer' for reviews, null for skips.",
+        description="Agent to dispatch. 'pr_reviewer', 'changelog_updater', or null.",
     )
     reason: str = Field(
         description="One-sentence plain-language explanation of the decision."
@@ -101,19 +102,30 @@ async def dispatch(
     event_summary: str,
     diff: str,
     settings: Settings,
+    *,
+    merged: bool = False,
 ) -> DispatchDecision:
-    """Route a PR event through the orchestrator LLM.
+    """Route a PR event through the orchestrator.
 
-    First applies deterministic pre-filters (empty diff, docs-only changes)
-    to skip obvious cases without an LLM call. Then loads playbook.md as
-    the system prompt, sends the event context + diff, and expects a JSON
-    dispatch decision back.
+    Order of evaluation:
+    1. merged=True → changelog fast path (no LLM call, deterministic)
+    2. Empty/whitespace diff → skip (no LLM call, deterministic)
+    3. Docs/config-only file extensions → skip (no LLM call, deterministic)
+    4. LLM path → review or skip (uses playbook.md persona)
 
-    Returns a DispatchDecision with action="review" or action="skip".
-    On persistent parse failures, falls back to action="review" (fail-open).
+    Returns a DispatchDecision. On LLM parse failures, falls back to
+    action="review" (fail-open).
     """
-    # Deterministic fast paths (no LLM call)
+    # 1. Merged PR → changelog fast path (no LLM call)
+    if merged:
+        logger.info("dispatch: PR merged — returning changelog (deterministic).")
+        return DispatchDecision(
+            action="changelog",
+            agent="changelog_updater",
+            reason="PR merged. Changelog agent will update README.md.",
+        )
 
+    # 2. Empty diff → skip (no LLM call)
     if not diff or not diff.strip():
         logger.info("dispatch: empty diff — skipping (deterministic).")
         return DispatchDecision(
@@ -130,7 +142,7 @@ async def dispatch(
             reason=f"Only non-code files changed ({exts}). Not a code review task.",
         )
 
-    # LLM path
+    # 4. LLM path
 
     playbook = load_playbook()
 

@@ -4,6 +4,6 @@
   "python.analysis.extraPaths": [
     "./"
   ],
-  "python.analysis.diagnosticMode": "basic",
+  "python.analysis.diagnosticMode": "workspace",
   "pyrefly.enable": false
 }
